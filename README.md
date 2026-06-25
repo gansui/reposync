@@ -1,9 +1,9 @@
 # RepoSync
 
 this repos is forked and improved from https://github.com/cidverse/reposync,the main improvement
-1.when the repo is an absolute url,like https://github.com/xxxx/xxxx,it will clone others public repo
-2.add sync command,the sync = clone + pull
-3.add --log-file dir switch，the log could be stored in file at dir. if no dir,the log file will be stored in file where the  config.yaml is saved.
+- 1.when the repo is an absolute url,like https://github.com/xxxx/xxxx,it will clone others public repo
+- 2.add sync command,the sync = clone + pull
+- 3.add --log-file dir switch，the log could be stored in file at dir. if no dir,the log file will be stored in file where the  config.yaml is saved.
 
 
 > You can configure one or more platforms as source to mirror the structure from the remote server onto your local system (repositories will be moved if necessary).
