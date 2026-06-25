@@ -1,0 +1,265 @@
+package cmd
+
+import (
+	"fmt"
+	"path/filepath"
+	"time"
+
+	"github.com/cidverse/go-vcsapp/pkg/platform/api"
+	"github.com/cidverse/go-vcsapp/pkg/vcsapp"
+	"github.com/cidverse/reposync/pkg/clone"
+	"github.com/cidverse/reposync/pkg/config"
+	"github.com/cidverse/reposync/pkg/repository"
+	"github.com/cidverse/reposync/pkg/util"
+	"github.com/rs/zerolog/log"
+	"github.com/spf13/cobra"
+)
+
+func cloneCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "clone",
+		Aliases: []string{},
+		Short:   `clones all repositories from configured remote servers`,
+		Run: func(cmd *cobra.Command, args []string) {
+			// flags
+			dryRun, err := cmd.Flags().GetBool("dry-run")
+			if err != nil {
+				log.Fatal().Err(err).Msg("failed to parse dry-run flag")
+			}
+			silent, err := cmd.Flags().GetBool("silent")
+			if err != nil {
+				log.Fatal().Err(err).Msg("failed to parse silent flag")
+			}
+
+			// config
+			c, err := config.Load(configFile)
+			if err != nil {
+				log.Fatal().Err(err).Str("file", configFile).Msg("failed to parse config file")
+			}
+
+			// state
+			stateFile := config.StateFile()
+			state, err := config.LoadState(stateFile)
+			if err != nil {
+				log.Fatal().Err(err).Str("file", configFile).Msg("failed to parse state file")
+			}
+			defer func(state *config.SyncState) { // ensure state is updated on exit
+				saveErr := config.SaveState(stateFile, state)
+				if saveErr != nil {
+					log.Fatal().Err(saveErr).Msg("failed to save state")
+				}
+			}(state)
+
+			// servers
+			for _, s := range c.Servers {
+				// skip if no local dir is specified
+				if s.Mirror.LocalDir == "" {
+					log.Debug().Str("server", s.Server).Str("type", s.Type).Msg("no local dir specified, skipping")
+					continue
+				}
+
+				// 检查是否有认证信息（支持平台API查询）
+				hasAuth := s.Auth.Password != "" || s.Auth.PasswordFile != "" || s.Auth.PasswordCommand != ""
+
+				if hasAuth {
+					// setup platform
+					log.Info().Str("server", s.Server).Str("type", s.Type).Msg("querying server")
+					platformAuth, platformAuthErr := config.AuthToPlatformConfig(s.Type, s.Server, s.Auth)
+					if platformAuthErr != nil {
+						log.Error().Err(platformAuthErr).Msg("failed to initialize platform auth")
+						continue
+					}
+					platform, platformErr := vcsapp.NewPlatform(platformAuth)
+					if platformErr != nil {
+						log.Error().Err(platformErr).Msg("failed to initialize platform")
+						continue
+					}
+
+					// query repositories
+					repos, repoErr := platform.Repositories(api.RepositoryListOpts{IncludeBranches: false, IncludeCommitHash: false})
+					if repoErr != nil {
+						log.Error().Err(repoErr).Msg("failed to list repositories")
+						continue
+					}
+					log.Info().Int("count", len(repos)).Str("server", s.Server).Msg("received repository list")
+
+					// process repositories
+					for _, r := range repos {
+						uniqueId := fmt.Sprintf("%s/%d", r.PlatformId, r.Id)
+						log.Info().Str("namespace", r.Namespace).Str("repo", r.Name).Msg("processing repository")
+
+						// check rules
+						if config.EvaluateRules(s.Mirror.Rules, s.Mirror.DefaultAction, r) == config.RuleActionExclude {
+							log.Debug().Str("namespace", r.Namespace).Str("repo", r.Name).Msg("repository excluded by rules, skipping")
+							continue
+						}
+
+						// remote
+						remote := r.CloneURL
+						if s.Mirror.CloneMethod == config.CloneMethodSSH {
+							remote = r.CloneSSH
+						}
+
+						// expected state
+						expectedState := config.RepositoryState{
+							ID:        uniqueId,
+							Namespace: r.Namespace,
+							Name:      r.Name,
+							Remote:    remote,
+							Directory: filepath.Join(util.ResolvePath(s.Mirror.LocalDir), util.Slugify(r.Namespace, string(s.Mirror.NamingStyle)), util.Slugify(r.Name, string(s.Mirror.NamingStyle))),
+							LastSync:  time.Now(),
+						}
+
+						// current state
+						currentState, inCurrentState := state.Repositories[uniqueId]
+
+						// run actions based on state
+						if !inCurrentState {
+							log.Debug().Str("repo", r.Namespace+"/"+r.Name).Str("current-dir", currentState.Directory).Str("expected-dir", expectedState.Directory).Msg("repository not present, cloning")
+							if dryRun {
+								continue
+							}
+
+							// add untracked repository in expected location, add to state (can occur if clone is interrupted and the state is not updated)
+							if repository.Exists(expectedState.Directory) {
+								log.Info().Str("repo", r.Namespace+"/"+r.Name).Str("dir", expectedState.Directory).Msg("adding existing repository to state")
+								state.Repositories[uniqueId] = expectedState
+								continue
+							}
+
+							// clone repository
+							cloneErr := repository.CloneRepository(expectedState.Directory, remote, silent)
+							if cloneErr != nil {
+								log.Error().Err(cloneErr).Str("repo", r.Namespace+"/"+r.Name).Msg("failed to clone repository")
+								continue
+							}
+						} else if currentState.Directory != expectedState.Directory {
+							log.Debug().Str("repo", r.Namespace+"/"+r.Name).Str("current-dir", currentState.Directory).Str("expected-dir", expectedState.Directory).Msg("repository present in different location, moving")
+							if dryRun {
+								continue
+							}
+
+							// move repository
+							moveErr := repository.MoveRepository(currentState.Directory, expectedState.Directory)
+							if moveErr != nil {
+								log.Error().Err(moveErr).Str("repo", r.Namespace+"/"+r.Name).Msg("failed to move repository")
+								continue
+							}
+						} else if currentState.Directory == expectedState.Directory {
+							log.Debug().Str("repo", r.Namespace+"/"+r.Name).Str("dir", expectedState.Directory).Msg("repository already present in expected location")
+						}
+
+						// dry-run
+						if dryRun {
+							continue
+						}
+
+						// update remote (allows easy switching between https/ssh for all repositories)
+						updateRemoteErr := repository.UpdateRemote(expectedState.Directory, remote, silent)
+						if updateRemoteErr != nil {
+							log.Error().Err(updateRemoteErr).Str("repo", r.Namespace+"/"+r.Name).Msg("failed to update remote")
+							continue
+						}
+
+						// add to state
+						state.Repositories[uniqueId] = expectedState
+					}
+
+					log.Info().Str("server", s.Server).Str("identity", s.Auth.Username).Int("repo_count", len(repos)).Msg("server processed")
+				} else {
+					log.Info().Str("server", s.Server).Msg("no auth configured, skipping platform API, only processing URL rules")
+				}
+
+				// 处理URL规则（直接克隆公共仓库）
+				directClones := config.ExtractDirectClones(s.Mirror.Rules)
+				for _, dc := range directClones {
+					if dc.Action == config.RuleActionExclude {
+						log.Debug().Str("url", dc.URL).Msg("direct clone excluded by rules, skipping")
+						continue
+					}
+
+					uniqueId := fmt.Sprintf("direct/%s/%s", dc.Namespace, dc.Name)
+					log.Info().Str("url", dc.URL).Str("namespace", dc.Namespace).Str("repo", dc.Name).Msg("processing direct clone")
+
+					// 期望状态
+					expectedState := config.RepositoryState{
+						ID:        uniqueId,
+						Namespace: dc.Namespace,
+						Name:      dc.Name,
+						Remote:    dc.URL,
+						Directory: filepath.Join(util.ResolvePath(s.Mirror.LocalDir), util.Slugify(dc.Namespace, string(s.Mirror.NamingStyle)), util.Slugify(dc.Name, string(s.Mirror.NamingStyle))),
+						LastSync:  time.Now(),
+					}
+
+					// 当前状态
+					currentState, inCurrentState := state.Repositories[uniqueId]
+
+					// 根据状态执行操作
+					needClone := false
+					if !inCurrentState {
+						log.Debug().Str("repo", dc.Namespace+"/"+dc.Name).Str("expected-dir", expectedState.Directory).Msg("direct clone not present, cloning")
+						needClone = true
+					} else if currentState.Directory != expectedState.Directory {
+						log.Debug().Str("repo", dc.Namespace+"/"+dc.Name).Str("current-dir", currentState.Directory).Str("expected-dir", expectedState.Directory).Msg("direct clone present in different location, moving")
+						if !dryRun {
+							moveErr := repository.MoveRepository(currentState.Directory, expectedState.Directory)
+							if moveErr != nil {
+								log.Error().Err(moveErr).Str("repo", dc.Namespace+"/"+dc.Name).Msg("failed to move direct repository")
+								continue
+							}
+						}
+					} else if !repository.Exists(expectedState.Directory) {
+						log.Debug().Str("repo", dc.Namespace+"/"+dc.Name).Str("dir", expectedState.Directory).Msg("direct clone directory missing, re-cloning")
+						needClone = true
+					}
+
+					if needClone {
+						if dryRun {
+							continue
+						}
+
+						// 如果目录已存在，添加到状态
+						if repository.Exists(expectedState.Directory) {
+							log.Info().Str("repo", dc.Namespace+"/"+dc.Name).Str("dir", expectedState.Directory).Msg("adding existing direct clone to state")
+							state.Repositories[uniqueId] = expectedState
+							continue
+						}
+
+						// 克隆仓库
+						cloneErr := repository.CloneRepository(expectedState.Directory, dc.URL, silent)
+						if cloneErr != nil {
+							log.Error().Err(cloneErr).Str("repo", dc.Namespace+"/"+dc.Name).Msg("failed to clone direct repository")
+							continue
+						}
+					}
+
+					// dry-run
+					if dryRun {
+						continue
+					}
+
+					// 更新远程地址
+					updateRemoteErr := repository.UpdateRemote(expectedState.Directory, dc.URL, silent)
+					if updateRemoteErr != nil {
+						log.Error().Err(updateRemoteErr).Str("repo", dc.Namespace+"/"+dc.Name).Msg("failed to update remote for direct clone")
+						continue
+					}
+
+					// 添加到状态
+					state.Repositories[uniqueId] = expectedState
+				}
+			}
+
+			// clone sources
+			for _, s := range c.Sources {
+				log.Debug().Str("remote", s.Url).Str("remote-ref", s.Ref).Str("target", s.TargetDir).Msg("processing project")
+				clone.FetchProject(s, s.TargetDir)
+			}
+		},
+	}
+
+	cmd.PersistentFlags().BoolP("dry-run", "d", false, "dry run")
+	cmd.PersistentFlags().BoolP("silent", "s", false, "silent (omit stdout/stderr output) from cli commands")
+
+	return cmd
+}

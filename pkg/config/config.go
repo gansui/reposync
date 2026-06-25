@@ -1,0 +1,224 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path"
+	"runtime"
+	"strings"
+
+	"github.com/cidverse/go-rules/pkg/expr"
+	"github.com/cidverse/go-vcsapp/pkg/platform/api"
+	"github.com/cidverse/go-vcsapp/pkg/vcsapp"
+	"github.com/rs/zerolog/log"
+)
+
+type RepoSyncConfig struct {
+	Version int                   `yaml:"version"`
+	Servers []Server              `yaml:"servers"`
+	Sources []RepoSource          `yaml:"sources"`
+	Bundle  map[string]RepoBundle `yaml:"bundle"`
+}
+
+type Server struct {
+	Server    string       `yaml:"url"`
+	Type      string       `yaml:"type"`
+	TargetDir string       `yaml:"target"`
+	Auth      RepoSyncAuth `yaml:"auth"`
+	Mirror    MirrorOpts   `yaml:"mirror"`
+}
+
+type RepoSource struct {
+	Url       string            `yaml:"url"`
+	Ref       string            `yaml:"ref"`
+	Group     []string          `yaml:"group"`
+	TargetDir string            `yaml:"target"`
+	Bundle    RepoBundleOptions `yaml:"bundle"`
+	Auth      RepoSyncAuth      `yaml:"auth"`
+}
+
+type RepoBundle struct {
+	TargetDir string       `yaml:"target"`
+	Sources   []RepoSource `yaml:"sources"`
+}
+
+type RepoSyncAuth struct {
+	Username        string `yaml:"username"`
+	Password        string `yaml:"password"`
+	PasswordFile    string `yaml:"password-file"`
+	PasswordCommand string `yaml:"password-command"` // PasswordCommand can be defined to call e.g. pass or another cli password manager
+}
+
+type RepoBundleOptions struct {
+	SourcePrefix string   `yaml:"source-prefix"`
+	TargetPrefix string   `yaml:"target-prefix"`
+	Extensions   []string `yaml:"extensions"`
+}
+
+type MirrorOpts struct {
+	LocalDir      string       `yaml:"dir"`
+	CloneMethod   CloneMethod  `yaml:"clone-method"`
+	NamingStyle   NamingStyle  `yaml:"naming-style"`
+	Rules         []MirrorRule `yaml:"rules"`
+	DefaultAction RuleAction   `yaml:"default-action"`
+}
+
+type MirrorRule struct {
+	Rule   string     `yaml:"rule"`
+	Action RuleAction `yaml:"action"`
+}
+
+type CloneMethod string
+
+const (
+	CloneMethodHTTPS CloneMethod = "https"
+	CloneMethodSSH   CloneMethod = "ssh"
+)
+
+type RuleAction string
+
+const (
+	RuleActionInclude RuleAction = "include"
+	RuleActionExclude RuleAction = "exclude"
+)
+
+type NamingStyle string
+
+const (
+	NamingSchemeName      NamingStyle = "name"
+	NamingSchemeLowercase NamingStyle = "lowercase"
+	NamingSchemeSlug      NamingStyle = "slug"
+)
+
+func AuthToPlatformConfig(serverType string, serverUrl string, auth RepoSyncAuth) (vcsapp.PlatformConfig, error) {
+	// password file
+	if auth.PasswordFile != "" {
+		// resolve path
+		auth.PasswordFile = strings.Replace(auth.PasswordFile, "~", os.Getenv("HOME"), 1)
+		auth.PasswordFile = os.ExpandEnv(auth.PasswordFile)
+
+		// read
+		file, err := os.ReadFile(auth.PasswordFile)
+		if err != nil {
+			return vcsapp.PlatformConfig{}, fmt.Errorf("failed to read password file: %w", err)
+		}
+		auth.Password = string(file)
+	} else if auth.PasswordCommand != "" && runtime.GOOS != "windows" {
+		cmdString := os.ExpandEnv(auth.PasswordCommand)
+		cmd := exec.Command("sh", "-c", cmdString)
+		cmd.Stdin = os.Stdin
+		cmd.Stderr = os.Stderr
+		out, err := cmd.Output()
+		if err != nil {
+			return vcsapp.PlatformConfig{}, fmt.Errorf("failed to execute password command: %w", err)
+		}
+
+		auth.Password = strings.TrimSpace(string(out))
+	}
+
+	// password is required
+	if auth.Password == "" {
+		return vcsapp.PlatformConfig{}, fmt.Errorf("no password provided")
+	}
+
+	// platform config
+	if serverType == "github" {
+		return vcsapp.PlatformConfig{
+			GitHubUsername: os.ExpandEnv(auth.Username),
+			GitHubToken:    os.ExpandEnv(auth.Password),
+		}, nil
+	} else if serverType == "gitlab" {
+		return vcsapp.PlatformConfig{
+			GitLabServer:      os.ExpandEnv(serverUrl),
+			GitLabAccessToken: os.ExpandEnv(auth.Password),
+		}, nil
+	}
+
+	return vcsapp.PlatformConfig{}, fmt.Errorf("unsupported server type: %s", serverType)
+}
+
+func EvaluateRules(rules []MirrorRule, defaultAction RuleAction, repo api.Repository) RuleAction {
+	ctx := map[string]interface{}{
+		"uniqueId": fmt.Sprintf("%s/%d", repo.PlatformId, repo.Id),
+		"id":       repo.Id,
+		"group":    repo.Namespace,
+		"path":     path.Join(repo.Namespace, repo.Name),
+		"name":     repo.Name,
+		"is_fork":  repo.IsFork,
+	}
+
+	for _, rule := range rules {
+		// 跳过URL规则，URL规则由ExtractDirectClones处理
+		if isURLRule(rule.Rule) {
+			continue
+		}
+		match, err := expr.EvaluateRule(rule.Rule, ctx)
+		if err != nil {
+			log.Fatal().Err(err).Str("rule", rule.Rule).Msg("failed to evaluate rule, check your configuration file syntax")
+		}
+		if match {
+			return rule.Action
+		}
+	}
+
+	return defaultAction
+}
+
+type DirectClone struct {
+	URL       string
+	Namespace string
+	Name      string
+	Action    RuleAction
+}
+
+func isURLRule(ruleExpr string) bool {
+	return strings.Contains(ruleExpr, "https://") || strings.Contains(ruleExpr, "http://")
+}
+
+func ExtractDirectClones(rules []MirrorRule) []DirectClone {
+	var clones []DirectClone
+	for _, rule := range rules {
+		if !isURLRule(rule.Rule) {
+			continue
+		}
+		// 从规则表达式中提取URL: path == "https://github.com/owner/repo"
+		url := extractURLFromRule(rule.Rule)
+		if url == "" {
+			log.Warn().Str("rule", rule.Rule).Msg("failed to extract URL from rule, skipping")
+			continue
+		}
+		// 解析URL获取namespace和name
+		namespace, name := parseGitHubURL(url)
+		clones = append(clones, DirectClone{
+			URL:       url,
+			Namespace: namespace,
+			Name:      name,
+			Action:    rule.Action,
+		})
+	}
+	return clones
+}
+
+func extractURLFromRule(ruleExpr string) string {
+	start := strings.Index(ruleExpr, "\"")
+	end := strings.LastIndex(ruleExpr, "\"")
+	if start == -1 || end == -1 || start >= end {
+		return ""
+	}
+	url := ruleExpr[start+1 : end]
+	if strings.HasPrefix(url, "https://") || strings.HasPrefix(url, "http://") {
+		return url
+	}
+	return ""
+}
+
+func parseGitHubURL(url string) (namespace, name string) {
+	// 支持 https://github.com/owner/repo 和 https://github.com/owner/repo.git
+	url = strings.TrimSuffix(url, ".git")
+	parts := strings.Split(strings.TrimPrefix(url, "https://github.com/"), "/")
+	if len(parts) >= 2 {
+		return parts[0], parts[1]
+	}
+	return "", ""
+}
